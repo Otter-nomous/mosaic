@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mosaic"
+version = "0.1.0"
+description = "Visual completion of chemical reaction schemes (ICML 2026 submission)."
+requires-python = ">=3.10"
+dependencies = [
+    "google-genai>=0.3",
+    "pydantic>=2.0",
+    "pillow>=10.0",
+    "tqdm>=4.65",
+]
+
+[project.scripts]
+mosaic = "mosaic.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mosaic*"]

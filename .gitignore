@@ -1,0 +1,22 @@
+# Rough Colab originals — kept locally for reference
+icml2026_validator_version.py
+icml2026_validator_version_few_shots.py
+ablation_study_visualization_(icml_style).py
+icml2026.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Pipeline output
+runs/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
