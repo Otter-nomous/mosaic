@@ -50,10 +50,22 @@ datasets/
     ...
 ```
 
+## Install
+
+```sh
+./install.sh
+```
+
+Picks the highest available Python 3.10+ on `PATH`, creates `./.venv`, and
+installs the package in editable mode. Re-running is safe.
+
+If you don't have Python 3.10+: `brew install python@3.12` (macOS) or use your
+distro's `python3.12` package / `pyenv` (Linux).
+
 ## Running
 
 ```sh
-pip install -e .
+source .venv/bin/activate
 export GOOGLE_API_KEY=...
 
 mosaic \
@@ -63,6 +75,8 @@ mosaic \
   --max-iterations 5 \
   --split val
 ```
+
+Or call `./.venv/bin/mosaic` directly without activating.
 
 Each run writes to `./runs/run_<timestamp>/` containing:
 
