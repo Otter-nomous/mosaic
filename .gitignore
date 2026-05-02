@@ -16,6 +16,10 @@ venv/
 # Pipeline output
 runs/
 
+# Datasets — kept locally, not tracked
+mosaic/data/
+data/
+
 # Editor / OS
 .DS_Store
 .idea/
