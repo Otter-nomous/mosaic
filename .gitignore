@@ -16,7 +16,13 @@ venv/
 # Pipeline output
 runs/
 
+# Dataset (kept locally; large binary images, not source-controlled)
+release_data/
+
 # Editor / OS
 .DS_Store
 .idea/
 .vscode/
+
+# Secrets (paste API keys into .secrets/<name>; auto-loaded by run_eval / bench_solvers)
+.secrets/
