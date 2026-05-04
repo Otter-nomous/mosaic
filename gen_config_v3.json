@@ -1,6 +1,6 @@
 {
   "default": {
-    "temperature": 1.0,
+    "temperature": 0,
     "seed": 42,
     "top_p": 1.0
   },

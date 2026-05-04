@@ -13,12 +13,14 @@ Writes a report directory under --output-dir/bench_<timestamp>/ containing:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime
 import html
 import json
 import os
 import pathlib
 import sys
+import threading
 import time
 import traceback
 
@@ -54,6 +56,13 @@ def main() -> int:
     ap.add_argument("--repeats", type=int, default=1,
                     help="Trials per model, executed back-to-back (model-major order) "
                          "so prompt-cache TTLs hold across repeats.")
+    ap.add_argument("--max-model-workers", type=int, default=None,
+                    help="How many solver models to run concurrently. Default: "
+                         "len(--models). Trials within a single model are still "
+                         "sequential to preserve prompt-cache hits across reps.")
+    ap.add_argument("--example-id", default=None,
+                    help="Pick this specific example_id from --data-dir. "
+                         "Default: alphabetically first.")
     args = ap.parse_args()
 
     gen_config = None
@@ -73,6 +82,11 @@ def main() -> int:
     if not examples:
         print("error: no examples found in --data-dir", file=sys.stderr)
         return 1
+    if args.example_id:
+        examples = [e for e in examples if e.example_id == args.example_id]
+        if not examples:
+            print(f"error: example_id {args.example_id!r} not found in --data-dir", file=sys.stderr)
+            return 1
     if len(examples) > 1:
         print(f"[bench] {len(examples)} examples available; using only the first")
     example = examples[0]
@@ -91,9 +105,14 @@ def main() -> int:
         max_workers=1,
     )
 
-    rows: list[dict] = []
-    for solver_model in args.models:
-        print(f"\n=== {solver_model} (repeats={args.repeats}) ===", flush=True)
+    print_lock = threading.Lock()
+
+    def log(msg: str) -> None:
+        with print_lock:
+            print(msg, flush=True)
+
+    def run_one_model(solver_model: str) -> list[dict]:
+        log(f"=== {solver_model} (repeats={args.repeats}) === starting")
         pipeline = Pipeline(
             solver=Solver(backend, solver_model),
             validator=Validator(backend, args.validator_model, prompts.VALIDATOR_PROMPT),
@@ -101,9 +120,9 @@ def main() -> int:
             config=config,
             few_shots=[],
         )
+        local_rows: list[dict] = []
+        tag = solver_model
         for trial in range(args.repeats):
-            if args.repeats > 1:
-                print(f"  --- trial {trial + 1}/{args.repeats} ---", flush=True)
             t0 = time.time()
             row: dict = {
                 "model": solver_model,
@@ -123,27 +142,46 @@ def main() -> int:
                 row["elapsed_s"] = time.time() - t0
                 if r.error:
                     row["error"] = r.error
-                    print(f"  ERROR: {r.error}")
+                    log(f"[{tag}] trial {trial + 1}/{args.repeats} ERROR: {r.error}")
                 else:
                     f = r.final
-                    row["valid"] = f.validation.is_valid_reactant
-                    row["correct"] = f.verification.is_same_chemical
                     row["validator_explanation"] = f.validation.explanation
                     row["verifier_explanation"] = f.verification.explanation
                     if f.solver_output_image is not None:
+                        # real validator + verifier verdicts
+                        row["valid"] = f.validation.is_valid_reactant
+                        row["correct"] = f.verification.is_same_chemical
                         img_name = f"{_safe_filename(solver_model)}_t{trial}.png"
                         img_path = os.path.join(out_dir, img_name)
                         f.solver_output_image.save(img_path)
                         row["image_path"] = img_name
                         row["image_size"] = list(f.solver_output_image.size)
-                        print(f"  image saved: {img_name} ({f.solver_output_image.size[0]}x{f.solver_output_image.size[1]})")
-                    print(f"  valid={row['valid']} correct={row['correct']} elapsed={row['elapsed_s']:.1f}s")
+                    else:
+                        # solver returned no image after retries — mark as
+                        # unknown rather than letting pipeline's synthetic
+                        # False/False bleed into the table.
+                        row["valid"] = None
+                        row["correct"] = None
+                    log(f"[{tag}] trial {trial + 1}/{args.repeats} valid={row['valid']} correct={row['correct']} elapsed={row['elapsed_s']:.1f}s")
             except Exception as exc:
                 row["elapsed_s"] = time.time() - t0
                 row["error"] = f"{type(exc).__name__}: {exc}"
-                print(f"  EXCEPTION: {row['error']}")
+                log(f"[{tag}] trial {trial + 1}/{args.repeats} EXCEPTION: {row['error']}")
                 traceback.print_exc()
-            rows.append(row)
+            local_rows.append(row)
+        log(f"=== {solver_model} === done, {len(local_rows)} trials")
+        return local_rows
+
+    n_workers = args.max_model_workers or max(1, len(args.models))
+    log(f"[bench] launching {len(args.models)} models with up to {n_workers} concurrent workers")
+    rows: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="bench") as ex:
+        futures = {ex.submit(run_one_model, m): m for m in args.models}
+        for fut in concurrent.futures.as_completed(futures):
+            rows.extend(fut.result())
+    # Sort rows so output is stable across runs (models in the order user passed, trials ascending).
+    model_order = {m: i for i, m in enumerate(args.models)}
+    rows.sort(key=lambda r: (model_order.get(r["model"], 1_000_000), r["trial_index"]))
 
     # results.json
     metadata = {
@@ -156,6 +194,7 @@ def main() -> int:
         "n_few_shots": 0,
         "gen_config": gen_config,
         "repeats": args.repeats,
+        "max_model_workers": n_workers,
     }
     with open(os.path.join(out_dir, "results.json"), "w", encoding="utf-8") as f:
         json.dump({"metadata": metadata, "rows": rows}, f, indent=2)
@@ -166,8 +205,8 @@ def main() -> int:
     summary_lines.append(header)
     summary_lines.append("-" * (len(header) + 30))
     for r in rows:
-        v = "—" if r["valid"] is None else str(r["valid"])
-        c = "—" if r["correct"] is None else str(r["correct"])
+        v = "?" if r["valid"] is None else str(r["valid"])
+        c = "?" if r["correct"] is None else str(r["correct"])
         size = "—" if not r["image_size"] else f"{r['image_size'][0]}x{r['image_size'][1]}"
         summary_lines.append(f"{r['model']:50s} {r['trial_index']:>5d} {v:>6s} {c:>8s} {r['elapsed_s']:>8.1f}  {size}")
     with open(os.path.join(out_dir, "summary.txt"), "w", encoding="utf-8") as f:
@@ -201,8 +240,8 @@ def _write_html_report(out_dir: str, metadata: dict, rows: list[dict], example) 
 
     rows_html = []
     for r in rows:
-        v = "—" if r["valid"] is None else ("✓" if r["valid"] else "✗")
-        c = "—" if r["correct"] is None else ("✓" if r["correct"] else "✗")
+        v = "?" if r["valid"] is None else ("✓" if r["valid"] else "✗")
+        c = "?" if r["correct"] is None else ("✓" if r["correct"] else "✗")
         img_html = img_tag(r["image_path"], "solver output")
         size = "—" if not r["image_size"] else f"{r['image_size'][0]}×{r['image_size'][1]}"
         err = f'<div style="color:#b00;">error: {html.escape(r["error"])}</div>' if r["error"] else ""
