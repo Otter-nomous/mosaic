@@ -46,11 +46,19 @@ class Split:
         yield "test", self.test
 
 
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+
+
 def load_examples(root: str) -> list[ReactionExample]:
-    """Load every subdirectory of `root` that contains exactly 4 image files."""
+    """Load every subdirectory of `root` that contains exactly 4 image files.
+
+    Non-image files (e.g. `thoughts` notes) are ignored when counting.
+    """
     grouped: dict[str, list[str]] = defaultdict(list)
     for dirpath, _dirs, files in os.walk(root):
         for fname in files:
+            if os.path.splitext(fname)[1].lower() not in _IMAGE_EXTS:
+                continue
             grouped[os.path.basename(dirpath)].append(os.path.join(dirpath, fname))
 
     examples = []

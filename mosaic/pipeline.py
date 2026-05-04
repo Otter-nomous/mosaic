@@ -8,10 +8,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 import PIL.Image
-from google.genai import types
 from tqdm import tqdm
 
-from .agents import Solver, Validator, Verifier, pil_to_part
+from .agents import ContentPart, ImagePart, Solver, TextPart, Validator, Verifier
 from .data import ReactionExample
 from .schemas import ExampleResult, IterationRecord, ValidationResult, VerificationResult
 
@@ -38,26 +37,26 @@ def load_few_shots(examples: list[ReactionExample]) -> list[FewShotExample]:
     ]
 
 
-def _build_few_shot_parts(few_shots: list[FewShotExample]) -> list[types.Part]:
-    parts: list[types.Part] = []
+def _build_few_shot_parts(few_shots: list[FewShotExample]) -> list[ContentPart]:
+    parts: list[ContentPart] = []
     if not few_shots:
         return parts
-    parts.append(types.Part(text="\n### FEW-SHOT EXAMPLES ###\n"))
+    parts.append(TextPart("\n### FEW-SHOT EXAMPLES ###\n"))
     for i, fs in enumerate(few_shots, 1):
-        parts.append(types.Part(text=f"\nExample {i}:\nReaction Template (A):"))
-        parts.append(pil_to_part(fs.image_a))
-        parts.append(types.Part(text="Product Template (B):"))
-        parts.append(pil_to_part(fs.image_b))
-        parts.append(types.Part(text="Target Product (C):"))
-        parts.append(pil_to_part(fs.image_c))
-        parts.append(types.Part(text="Expected Reactant X (D):"))
-        parts.append(pil_to_part(fs.image_d))
-        parts.append(types.Part(text="\n---\n"))
-    parts.append(types.Part(text="### END FEW-SHOT EXAMPLES ###\n\n"))
+        parts.append(TextPart(f"\nExample {i}:\nReaction Template (A):"))
+        parts.append(ImagePart(fs.image_a))
+        parts.append(TextPart("Product Template (B):"))
+        parts.append(ImagePart(fs.image_b))
+        parts.append(TextPart("Target Product (C):"))
+        parts.append(ImagePart(fs.image_c))
+        parts.append(TextPart("Expected Reactant X (D):"))
+        parts.append(ImagePart(fs.image_d))
+        parts.append(TextPart("\n---\n"))
+    parts.append(TextPart("### END FEW-SHOT EXAMPLES ###\n\n"))
     return parts
 
 
-def _build_correction_block(history: list[IterationRecord]) -> tuple[list[types.Part], str]:
+def _build_correction_block(history: list[IterationRecord]) -> tuple[list[ContentPart], str]:
     """Compose feedback from previous attempts into model parts plus a text trace.
 
     Returns (parts_for_model, text_for_report).
@@ -65,7 +64,7 @@ def _build_correction_block(history: list[IterationRecord]) -> tuple[list[types.
     if not history:
         return [], ""
 
-    parts: list[types.Part] = []
+    parts: list[ContentPart] = []
     text_lines: list[str] = []
 
     header = (
@@ -73,32 +72,32 @@ def _build_correction_block(history: list[IterationRecord]) -> tuple[list[types.
         "You have received feedback on your previous attempts. Review the history below "
         "and generate a corrected Reactant X that addresses the issues.\n\n"
     )
-    parts.append(types.Part(text=header))
+    parts.append(TextPart(header))
     text_lines.append(header)
 
     for prior in history:
         feedback = prior.validation.explanation
         line = f"**Iteration {prior.iteration} feedback:** \"{feedback}\"\n"
-        parts.append(types.Part(text=line))
+        parts.append(TextPart(line))
         text_lines.append(line)
 
         if prior.solver_output_image is not None:
-            parts.append(types.Part(text=f"Image generated in iteration {prior.iteration}:\n"))
-            parts.append(pil_to_part(prior.solver_output_image))
+            parts.append(TextPart(f"Image generated in iteration {prior.iteration}:\n"))
+            parts.append(ImagePart(prior.solver_output_image))
             text_lines.append(f"Image generated in iteration {prior.iteration}:\n<IMAGE>\n")
         else:
             line = f"No image was generated in iteration {prior.iteration}.\n"
-            parts.append(types.Part(text=line))
+            parts.append(TextPart(line))
             text_lines.append(line)
 
-        parts.append(types.Part(text="---\n"))
+        parts.append(TextPart("---\n"))
         text_lines.append("---\n")
 
     closing = (
         "Re-evaluate the original inputs and generate a corrected Reactant X that resolves "
         "all feedback while still adhering to the drawing standards.\n"
     )
-    parts.append(types.Part(text=closing))
+    parts.append(TextPart(closing))
     text_lines.append(closing)
 
     return parts, "".join(text_lines)
@@ -114,18 +113,18 @@ def _build_solver_contents(
     image_a: PIL.Image.Image,
     image_b: PIL.Image.Image,
     image_c: PIL.Image.Image,
-    few_shot_parts: list[types.Part],
-    correction_parts: list[types.Part],
+    few_shot_parts: list[ContentPart],
+    correction_parts: list[ContentPart],
     correction_text: str,
-) -> tuple[list[types.Part], str]:
+) -> tuple[list[ContentPart], str]:
     """Substitute placeholders in the template with real content + a textual trace."""
-    contents: list[types.Part] = []
+    contents: list[ContentPart] = []
     text_trace: list[str] = []
     image_map = {"$IMAGE_A": image_a, "$IMAGE_B": image_b, "$IMAGE_C": image_c}
 
     for segment in _PLACEHOLDER_PATTERN.split(template):
         if segment in image_map:
-            contents.append(pil_to_part(image_map[segment]))
+            contents.append(ImagePart(image_map[segment]))
             text_trace.append(f"<{segment[1:]}>")
         elif segment == "$FEW_SHOT_DEMOSTRATION":
             contents.extend(few_shot_parts)
@@ -134,7 +133,7 @@ def _build_solver_contents(
             contents.extend(correction_parts)
             text_trace.append(correction_text)
         elif segment:
-            contents.append(types.Part(text=segment))
+            contents.append(TextPart(segment))
             text_trace.append(segment)
 
     return contents, "".join(text_trace)
