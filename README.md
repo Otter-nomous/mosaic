@@ -26,9 +26,14 @@ Iteration stops when the validator says `is_valid_reactant=true` or after
 ```sh
 git clone https://github.com/Otter-nomous/mosaic.git
 cd mosaic
-./install.sh                 # creates .venv and pip install -e .
+./install.sh
 source .venv/bin/activate
 ```
+
+`install.sh` picks the highest available Python 3.10+ on `PATH`, creates
+`./.venv`, and installs the package in editable mode. Re-running is safe.
+If you don't have Python 3.10+: `brew install python@3.12` (macOS) or use
+your distro's `python3.12` package / `pyenv` (Linux).
 
 ## API keys
 
