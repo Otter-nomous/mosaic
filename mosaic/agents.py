@@ -92,11 +92,27 @@ class Backend(Protocol):
 # ---------------------------------------------------------------------------
 
 
+_GEMINI_SAMPLING_KEYS = {"temperature", "top_p", "top_k", "seed"}
+
+
 class GeminiBackend:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, gen_config: Optional[dict] = None):
         from google import genai
         self._genai = genai
         self.client = genai.Client(api_key=api_key)
+        # Same shape as OpenRouterBackend.gen_config:
+        #   {"default": {...}, "per_model": {model: {...}}}
+        # A ``null`` value in per_model opts that key out of the default —
+        # useful for image-gen variants that 400 on `temperature` or `seed`.
+        self.gen_config = gen_config or {}
+
+    def _params_for(self, model: str) -> dict:
+        merged = dict(self.gen_config.get("default") or {})
+        merged.update(self.gen_config.get("per_model", {}).get(model) or {})
+        return {
+            k: v for k, v in merged.items()
+            if v is not None and k in _GEMINI_SAMPLING_KEYS
+        }
 
     def _to_parts(self, contents: list[ContentPart]) -> list[Any]:
         from google.genai import types
@@ -118,7 +134,8 @@ class GeminiBackend:
     ) -> Optional[PIL.Image.Image]:
         from google.genai import types
         config = types.GenerateContentConfig(
-            http_options=types.HttpOptions(timeout=timeout_seconds * 1000)
+            http_options=types.HttpOptions(timeout=timeout_seconds * 1000),
+            **self._params_for(model),
         )
         response = self.client.models.generate_content(
             model=model, contents=self._to_parts(contents), config=config
@@ -142,6 +159,7 @@ class GeminiBackend:
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=schema,
+                **self._params_for(model),
             ),
         )
         return response.text
@@ -427,6 +445,57 @@ def _decode_b64(payload: str) -> Optional[PIL.Image.Image]:
         return PIL.Image.open(io.BytesIO(base64.b64decode(payload)))
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Backend factory (auto-route by model name)
+# ---------------------------------------------------------------------------
+
+
+def is_gemini_direct(model: str) -> bool:
+    """A bare ``gemini-...`` name (no ``/``) routes to GeminiBackend.
+
+    Slash-prefixed names (e.g. ``google/gemini-3-pro-image-preview``,
+    ``openai/gpt-5.4``) route to OpenRouter. The two model-name conventions are
+    already used throughout ``mosaic.models``.
+    """
+    return "/" not in model
+
+
+def make_backend(
+    model: str,
+    *,
+    openrouter_api_key: Optional[str],
+    google_api_key: Optional[str],
+    openrouter_base_url: str,
+    openrouter_max_concurrent_calls: int = 4,
+    gen_config: Optional[dict] = None,
+) -> Backend:
+    """Pick the right backend for ``model`` based on its name.
+
+    Raises if the required key for the chosen provider is missing. ``gen_config``
+    is the unified sampling-params config (same shape for both backends);
+    OpenRouter-only keys (e.g. ``provider`` overrides) are ignored by
+    GeminiBackend, and vice versa.
+    """
+    if is_gemini_direct(model):
+        if not google_api_key:
+            raise RuntimeError(
+                f"model {model!r} routes to Gemini direct; set $GOOGLE_API_KEY "
+                f"or pass --google-api-key-file."
+            )
+        return GeminiBackend(api_key=google_api_key, gen_config=gen_config)
+    if not openrouter_api_key:
+        raise RuntimeError(
+            f"model {model!r} routes through OpenRouter; set $OPENROUTER_API_KEY "
+            f"or pass --api-key-file."
+        )
+    return OpenRouterBackend(
+        api_key=openrouter_api_key,
+        base_url=openrouter_base_url,
+        max_concurrent_calls=openrouter_max_concurrent_calls,
+        gen_config=gen_config,
+    )
 
 
 # ---------------------------------------------------------------------------

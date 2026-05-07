@@ -25,7 +25,14 @@ import time
 import traceback
 
 from mosaic import prompts
-from mosaic.agents import OpenRouterBackend, Solver, Validator, Verifier
+from mosaic.agents import (
+    Backend,
+    Solver,
+    Validator,
+    Verifier,
+    is_gemini_direct,
+    make_backend,
+)
 from mosaic.data import load_examples
 from mosaic.models import (
     DEFAULT_VALIDATOR_OPENROUTER,
@@ -36,6 +43,11 @@ from mosaic.models import (
 from mosaic.pipeline import Pipeline, PipelineConfig
 
 
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_OPENROUTER_KEY_FILE = os.path.join(_REPO_ROOT, ".secrets", "openrouter_api_key")
+_DEFAULT_GOOGLE_KEY_FILE = os.path.join(_REPO_ROOT, ".secrets", "google_api_key")
+
+
 def _safe_filename(model: str) -> str:
     return model.replace("/", "__").replace(":", "_")
 
@@ -43,7 +55,16 @@ def _safe_filename(model: str) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", required=True)
-    ap.add_argument("--api-key-file", required=True)
+    ap.add_argument("--api-key-file", default=None,
+                    help="Path to a file containing the OpenRouter API key. "
+                         "Resolution order: this flag, then $OPENROUTER_API_KEY, "
+                         "then .secrets/openrouter_api_key. Required only if any "
+                         "model routes through OpenRouter (slash in name).")
+    ap.add_argument("--google-api-key-file", default=None,
+                    help="Path to a file containing the Gemini (Google AI) API key. "
+                         "Resolution order: this flag, then $GOOGLE_API_KEY, then "
+                         ".secrets/google_api_key. Required only if any model routes "
+                         "to Gemini direct (bare 'gemini-...' name).")
     ap.add_argument("--output-dir", default="runs")
     ap.add_argument("--validator-model", default=DEFAULT_VALIDATOR_OPENROUTER)
     ap.add_argument("--verifier-model", default=DEFAULT_VERIFIER_OPENROUTER)
@@ -70,13 +91,37 @@ def main() -> int:
         with open(os.path.expanduser(args.gen_config), "r", encoding="utf-8") as f:
             gen_config = json.load(f)
 
-    with open(os.path.expanduser(args.api_key_file), "r", encoding="utf-8") as f:
-        api_key = f.read().strip()
-    if not api_key:
-        print("error: api key file is empty", file=sys.stderr)
-        return 2
+    def _read_key(path: str | None, env_var: str, default_file: str | None) -> str | None:
+        if path:
+            with open(os.path.expanduser(path), "r", encoding="utf-8") as f:
+                return f.read().strip() or None
+        val = os.environ.get(env_var)
+        if val:
+            return val
+        if default_file and os.path.exists(default_file):
+            with open(default_file, "r", encoding="utf-8") as f:
+                return f.read().strip() or None
+        return None
 
-    backend = OpenRouterBackend(api_key=api_key, base_url=OPENROUTER_BASE_URL, gen_config=gen_config)
+    openrouter_api_key = _read_key(
+        args.api_key_file, "OPENROUTER_API_KEY", _DEFAULT_OPENROUTER_KEY_FILE
+    )
+    google_api_key = _read_key(
+        args.google_api_key_file, "GOOGLE_API_KEY", _DEFAULT_GOOGLE_KEY_FILE
+    )
+
+    all_models = list(args.models) + [args.validator_model, args.verifier_model]
+    needs_openrouter = any(not is_gemini_direct(m) for m in all_models)
+    needs_google = any(is_gemini_direct(m) for m in all_models)
+    if needs_openrouter and not openrouter_api_key:
+        print("error: OpenRouter API key missing for one or more models. "
+              "Set $OPENROUTER_API_KEY or pass --api-key-file.", file=sys.stderr)
+        return 2
+    if needs_google and not google_api_key:
+        print("error: Gemini API key missing for one or more bare 'gemini-...' "
+              "models. Set $GOOGLE_API_KEY or pass --google-api-key-file.",
+              file=sys.stderr)
+        return 2
 
     examples = load_examples(args.data_dir)
     if not examples:
@@ -113,10 +158,35 @@ def main() -> int:
 
     def run_one_model(solver_model: str) -> list[dict]:
         log(f"=== {solver_model} (repeats={args.repeats}) === starting")
+        # Per-provider backend cache so solver/validator/verifier on the same
+        # provider share an httpx pool, but Gemini-direct vs OpenRouter get
+        # their own clients.
+        backend_cache: dict[str, Backend] = {}
+
+        def get_backend(model: str) -> Backend:
+            key = "gemini" if is_gemini_direct(model) else "openrouter"
+            if key not in backend_cache:
+                backend_cache[key] = make_backend(
+                    model,
+                    openrouter_api_key=openrouter_api_key,
+                    google_api_key=google_api_key,
+                    openrouter_base_url=OPENROUTER_BASE_URL,
+                    gen_config=gen_config,
+                )
+            return backend_cache[key]
+
         pipeline = Pipeline(
-            solver=Solver(backend, solver_model),
-            validator=Validator(backend, args.validator_model, prompts.VALIDATOR_PROMPT),
-            verifier=Verifier(backend, args.verifier_model, prompts.VERIFIER_PROMPT),
+            solver=Solver(get_backend(solver_model), solver_model),
+            validator=Validator(
+                get_backend(args.validator_model),
+                args.validator_model,
+                prompts.VALIDATOR_PROMPT,
+            ),
+            verifier=Verifier(
+                get_backend(args.verifier_model),
+                args.verifier_model,
+                prompts.VERIFIER_PROMPT,
+            ),
             config=config,
             few_shots=[],
         )

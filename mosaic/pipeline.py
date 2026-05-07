@@ -122,7 +122,14 @@ def _build_solver_contents(
     text_trace: list[str] = []
     image_map = {"$IMAGE_A": image_a, "$IMAGE_B": image_b, "$IMAGE_C": image_c}
 
+    image_a_seen = False
     for segment in _PLACEHOLDER_PATTERN.split(template):
+        if segment == "$IMAGE_A" and not image_a_seen and contents:
+            # Everything emitted so far (prompt text + few-shot block) is identical
+            # across every example in a run; mark it as a cache prefix so OpenRouter
+            # serves it from cache after the first call. No-op on Gemini backend.
+            contents[-1].cache_breakpoint = True
+            image_a_seen = True
         if segment in image_map:
             contents.append(ImagePart(image_map[segment]))
             text_trace.append(f"<{segment[1:]}>")
@@ -158,6 +165,7 @@ class Pipeline:
         verifier: Optional[Verifier],
         config: PipelineConfig,
         few_shots: Optional[list[FewShotExample]] = None,
+        prior_iterations_by_id: Optional[dict[str, list[IterationRecord]]] = None,
     ):
         self.solver = solver
         self.validator = validator
@@ -165,6 +173,11 @@ class Pipeline:
         self.config = config
         self.few_shots = few_shots or []
         self._few_shot_parts = _build_few_shot_parts(self.few_shots)
+        # Per-example prior iterations from a previous run. When present, the
+        # loop skips ahead to iter (len(prior) + 1). If the last prior already
+        # validated, the example is short-circuited with the prior history
+        # returned unchanged.
+        self.prior_iterations_by_id = prior_iterations_by_id or {}
 
     def run_example(self, example: ReactionExample) -> ExampleResult:
         try:
@@ -181,7 +194,15 @@ class Pipeline:
 
         result = ExampleResult(example_id=example.example_id, input_paths=example.all_paths)
 
-        for i in range(1, self.config.max_iterations + 1):
+        prior = self.prior_iterations_by_id.get(example.example_id, [])
+        if prior:
+            result.iterations.extend(prior)
+            # Already validated in the prior run — nothing to do.
+            if prior[-1].validation.is_valid_reactant:
+                return result
+
+        start_iter = len(result.iterations) + 1
+        for i in range(start_iter, self.config.max_iterations + 1):
             correction_parts, correction_text = _build_correction_block(result.iterations)
             contents, prompt_text = _build_solver_contents(
                 self.config.solver_prompt,
@@ -247,10 +268,21 @@ class Pipeline:
                 explanation=f"Verifier error: {exc}",
             )
 
+    def _is_short_circuit(self, example: ReactionExample) -> bool:
+        """True if a prior run already validated this example — run_example
+        will return immediately without any API calls."""
+        prior = self.prior_iterations_by_id.get(example.example_id, [])
+        return bool(prior and prior[-1].validation.is_valid_reactant)
+
     def run_dataset(self, examples: list[ReactionExample]) -> list[ExampleResult]:
+        # Submit short-circuit (already-validated) examples first. They
+        # complete in milliseconds, so the tqdm bar zips through them up front
+        # and the long tail is just the examples that actually need API calls.
+        # Pure no-op when prior_iterations_by_id is empty.
+        ordered = sorted(examples, key=lambda e: not self._is_short_circuit(e))
         results: list[ExampleResult] = []
         with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
-            futures = {pool.submit(self.run_example, ex): ex for ex in examples}
+            futures = {pool.submit(self.run_example, ex): ex for ex in ordered}
             for future in tqdm(as_completed(futures), total=len(futures), desc="examples"):
                 ex = futures[future]
                 try:
