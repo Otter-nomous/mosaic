@@ -1,0 +1,22 @@
+{
+  "default": {
+    "temperature": 0,
+    "seed": 42,
+    "top_p": 1.0
+  },
+  "per_model": {
+    "openai/gpt-5.4-image-2": {
+      "temperature": null,
+      "top_p": null
+    },
+    "openai/gpt-5-image": {
+      "temperature": null,
+      "top_p": null
+    },
+    "openai/gpt-5-image-mini": {
+      "temperature": null,
+      "top_p": null
+    }
+  }
+}
+
