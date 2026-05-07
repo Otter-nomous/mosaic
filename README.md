@@ -80,17 +80,17 @@ The folder name is the example id and is used throughout reports.
 
 ## Running an evaluation
 
-The main driver is `run_eval.py` — it sweeps one or more solver models over a
-dataset, with two levels of parallelism (per-model and per-example).
+The main driver is `scripts/run_eval.py` — it sweeps one or more solver models
+over a dataset, with two levels of parallelism (per-model and per-example).
 
 ```sh
 # Smallest useful run: 2 examples, default solvers (one OpenAI + one Gemini),
 # default validator/verifier (Gemini Flash), 5 iterations.
-python run_eval.py --limit 2
+python scripts/run_eval.py --limit 2
 
 # Real eval: three Gemini solvers, full eval set, 8 iterations,
 # 12 examples in flight per model, 1 model at a time.
-python run_eval.py \
+python scripts/run_eval.py \
   --solver-models \
       gemini-3-pro-image-preview \
       gemini-3.1-flash-image-preview \
@@ -116,7 +116,7 @@ A top-level `summary.txt` aggregates per-model metrics across the sweep.
 
 ### Sampling parameters
 
-`--gen-config <path>` (default: `gen_config_v3.json`) sets temperature / top_p /
+`--gen-config <path>` (default: `scripts/gen_config_v3.json`) sets temperature / top_p /
 seed. The schema is `{"default": {...}, "per_model": {model: {...}}}`; a `null`
 entry under `per_model` opts that model out of the corresponding default
 (needed for OpenAI image models that 400 on `temperature`).
@@ -135,7 +135,7 @@ fresh:
 
 ```sh
 # A run finished at iter 5 — push it to iter 8 without re-doing iter 1-5.
-python run_eval.py \
+python scripts/run_eval.py \
   --resume-from runs/run_20260504_174107 \
   --max-iterations 8 \
   --solver-models gemini-3-pro-image-preview
@@ -153,6 +153,8 @@ wall-clock.
 
 ## Helper scripts
 
+All under `scripts/`.
+
 - **`bench_solvers.py`** — single-shot sanity check across the curated solver
   list on one example. Quick way to see "does this model produce a sensible
   image at all?" before spending money on the full sweep.
@@ -168,6 +170,9 @@ wall-clock.
 - **`extract_iter_images.py`** — one-shot helper for runs predating per-iter
   image persistence: parses `example_*.html` and writes
   `iter_images/<id>/iter_N.png` so they can be `--resume-from`'d.
+- **`diag_one_solver.py`** / **`diag_openrouter.py`** / **`diag_resolution.py`**
+  — small diagnostics: end-to-end run of one solver, OpenRouter health probe,
+  output-resolution-hint check.
 
 ## Plots
 
@@ -234,14 +239,16 @@ mosaic/
   reporting.py   write_report(), write_results_json()
   cli.py         argparse runner for the simple one-model train/val workflow
 
-run_eval.py            Multi-model eval driver (the one most users want)
-bench_solvers.py       Single-shot solver sanity check
-run_validators.py      Validator-vs-verifier agreement matrix
-compare_verifiers.py   Re-score finished runs with a new verifier
-run_few_shots_eval.py  Few-shot count ablation sweep
-extract_iter_images.py Backfill iter_images/ for legacy runs
+scripts/
+  run_eval.py            Multi-model eval driver (the one most users want)
+  bench_solvers.py       Single-shot solver sanity check
+  run_validators.py      Validator-vs-verifier agreement matrix
+  compare_verifiers.py   Re-score finished runs with a new verifier
+  run_few_shots_eval.py  Few-shot count ablation sweep
+  extract_iter_images.py Backfill iter_images/ for legacy runs
+  diag_*.py              Single-shot diagnostics
+  gen_config*.json       Default sampling params (temperature/top_p/seed)
 
-plots/                 NeurIPS-style figure scripts (.pdf + .png outputs)
-gen_config_v3.json     Default sampling params (temperature/top_p/seed)
-.secrets/              Gitignored; drop API key files here
+plots/                   NeurIPS-style figure scripts (.pdf + .png outputs)
+.secrets/                Gitignored; drop API key files here
 ```

@@ -56,7 +56,7 @@ from mosaic.pipeline import _build_solver_contents
 from mosaic.schemas import ValidationResult, VerificationResult
 
 
-_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DEFAULT_DATA_DIR = os.path.join(_REPO_ROOT, "release_data", "eval")
 _DEFAULT_OPENROUTER_KEY_FILE = os.path.join(_REPO_ROOT, ".secrets", "openrouter_api_key")
 _DEFAULT_GOOGLE_KEY_FILE = os.path.join(_REPO_ROOT, ".secrets", "google_api_key")

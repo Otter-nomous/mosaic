@@ -96,7 +96,14 @@ _GEMINI_SAMPLING_KEYS = {"temperature", "top_p", "top_k", "seed"}
 
 
 class GeminiBackend:
-    def __init__(self, api_key: str, gen_config: Optional[dict] = None):
+    def __init__(
+        self,
+        api_key: str,
+        gen_config: Optional[dict] = None,
+        max_retries: int = 5,
+        retry_base_seconds: float = 2.0,
+        retry_max_seconds: float = 60.0,
+    ):
         from google import genai
         self._genai = genai
         self.client = genai.Client(api_key=api_key)
@@ -105,6 +112,53 @@ class GeminiBackend:
         # A ``null`` value in per_model opts that key out of the default —
         # useful for image-gen variants that 400 on `temperature` or `seed`.
         self.gen_config = gen_config or {}
+        self.max_retries = max_retries
+        self.retry_base_seconds = retry_base_seconds
+        self.retry_max_seconds = retry_max_seconds
+
+    def _with_retry(self, label: str, fn):
+        """Run ``fn()`` with backoff on transient Gemini errors.
+
+        Preview-tier models (e.g. ``gemini-3-flash-preview``) routinely return
+        503 UNAVAILABLE under load. Also retry 429 RESOURCE_EXHAUSTED and any
+        500/INTERNAL. 4xx other than 429 propagates immediately. Any other
+        exception (including unknown internal errors from google-genai under
+        concurrent load) is also retried — bounded by ``max_retries`` so we
+        can't loop forever — since we've observed the genai client raise
+        bare ``AssertionError`` from inside its own transport under burst.
+        """
+        from google.genai import errors as genai_errors
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return fn()
+            except genai_errors.ClientError as exc:
+                # Only retry rate-limited (429); other 4xx are fatal.
+                code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+                msg = str(exc)
+                if code == 429 or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    last_exc = exc
+                else:
+                    raise
+            except genai_errors.ServerError as exc:
+                last_exc = exc  # 5xx — always retry
+            except Exception as exc:
+                # Catch-all for unknown transient errors (e.g. internal
+                # AssertionError from google-genai's transport under
+                # concurrent burst). Retried just like 5xx.
+                last_exc = exc
+            if attempt >= self.max_retries:
+                break
+            wait = _compute_backoff(
+                attempt, self.retry_base_seconds, self.retry_max_seconds, None
+            )
+            print(f"[gemini:{label}] {type(last_exc).__name__}: "
+                  f"{str(last_exc)[:80] or '(no message)'}; "
+                  f"retry {attempt + 1}/{self.max_retries} in {wait:.1f}s",
+                  flush=True)
+            time.sleep(wait)
+        assert last_exc is not None
+        raise last_exc
 
     def _params_for(self, model: str) -> dict:
         merged = dict(self.gen_config.get("default") or {})
@@ -133,13 +187,14 @@ class GeminiBackend:
         self, model: str, contents: list[ContentPart], timeout_seconds: int
     ) -> Optional[PIL.Image.Image]:
         from google.genai import types
+        bare = _gemini_bare_name(model)
         config = types.GenerateContentConfig(
             http_options=types.HttpOptions(timeout=timeout_seconds * 1000),
-            **self._params_for(model),
+            **self._params_for(bare),
         )
-        response = self.client.models.generate_content(
-            model=model, contents=self._to_parts(contents), config=config
-        )
+        response = self._with_retry(bare, lambda: self.client.models.generate_content(
+            model=bare, contents=self._to_parts(contents), config=config,
+        ))
         return _extract_gemini_image(response)
 
     def generate_json(
@@ -153,16 +208,19 @@ class GeminiBackend:
         flat: list[Any] = []
         for c in contents:
             flat.append(c.text if isinstance(c, TextPart) else c.image)
-        response = self.client.models.generate_content(
-            model=model,
-            contents=flat,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=schema,
-                **self._params_for(model),
-            ),
+        bare = _gemini_bare_name(model)
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=schema,
+            **self._params_for(bare),
         )
-        return response.text
+        response = self._with_retry(bare, lambda: self.client.models.generate_content(
+            model=bare, contents=flat, config=config,
+        ))
+        # Native structured-output usually returns clean JSON, but apply the
+        # same extractor as the OpenRouter path so prose-wrapped edge cases
+        # don't trip the strict parser.
+        return _strip_to_json(response.text or "")
 
 
 def _extract_gemini_image(response: Any) -> Optional[PIL.Image.Image]:
@@ -267,6 +325,10 @@ class OpenRouterBackend:
                 # Only retry rate-limit (429) and server errors (5xx).
                 if exc.status_code != 429 and not (500 <= exc.status_code < 600):
                     raise
+                last_exc = exc
+            except Exception as exc:
+                # Catch-all for unknown transient errors (e.g. internal httpx
+                # state corruption under concurrent burst). Retried like 5xx.
                 last_exc = exc
 
             if attempt >= self.max_retries:
@@ -383,8 +445,51 @@ _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE | re.MUL
 
 
 def _strip_to_json(text: str) -> str:
-    """Some models still wrap JSON in code fences despite json_object — peel them."""
+    """Coerce a model response down to a JSON object, robustly.
+
+    Models on OpenRouter don't all honor ``response_format: json_object``
+    equally well. Anthropic Sonnet, in particular, has been observed wrapping
+    the JSON in natural-language commentary ("I need to analyze whether ...
+    {\"is_valid_reactant\": true, ...}"), which strict ``model_validate_json``
+    rejects.
+
+    Order of operations:
+      1. Strip ```json fences (handles models that wrap in markdown).
+      2. If the cleaned text already starts with `{`, return as-is.
+      3. Otherwise, scan forward to the first `{` and extract a balanced
+         brace block — string-aware so braces inside strings don't confuse
+         the depth counter.
+
+    Fall-throughs (no `{` found, or unbalanced) return the cleaned text
+    unchanged so the caller's strict parser raises with a useful message.
+    """
     cleaned = _FENCE_RE.sub("", text).strip()
+    if not cleaned or cleaned.startswith("{"):
+        return cleaned
+    start = cleaned.find("{")
+    if start < 0:
+        return cleaned
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(cleaned)):
+        c = cleaned[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+        else:
+            if c == '"':
+                in_string = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return cleaned[start : i + 1]
     return cleaned
 
 
@@ -453,13 +558,48 @@ def _decode_b64(payload: str) -> Optional[PIL.Image.Image]:
 
 
 def is_gemini_direct(model: str) -> bool:
-    """A bare ``gemini-...`` name (no ``/``) routes to GeminiBackend.
+    """Whether the model name looks like a Google AI Studio model
+    (Gemini or Gemma — both served by ``google-genai`` with a Google API key).
 
-    Slash-prefixed names (e.g. ``google/gemini-3-pro-image-preview``,
-    ``openai/gpt-5.4``) route to OpenRouter. The two model-name conventions are
-    already used throughout ``mosaic.models``.
+    Accepts both forms used throughout ``mosaic.models``:
+      - bare:           ``gemini-...``, ``gemma-...``
+      - slash-prefixed: ``google/gemini-...``, ``google/gemma-...``
+
+    This is a NAME predicate. The actual backend routing also requires a
+    Google API key — see ``pick_provider`` and ``make_backend``. Without a
+    Google key, slash-prefixed names fall back to OpenRouter; bare names
+    raise (no OpenRouter analog).
     """
-    return "/" not in model
+    bare = model[len("google/"):] if model.startswith("google/") else model
+    return bare.startswith("gemini-") or bare.startswith("gemma-")
+
+
+def _gemini_bare_name(model: str) -> str:
+    """Strip the leading ``google/`` (if any) so the bare model id is sent to
+    the Google AI API, which doesn't accept the OpenRouter-style prefix.
+    Used for both Gemini and Gemma names.
+    """
+    return model[len("google/") :] if model.startswith("google/") else model
+
+
+def pick_provider(model: str, google_api_key: Optional[str]) -> str:
+    """Return ``'gemini'`` or ``'openrouter'`` — the provider ``make_backend``
+    will route ``model`` to under the given key availability.
+
+    Rules:
+      - Gemini-named model + Google key present → Gemini direct.
+      - Bare ``gemini-...`` (no slash) → Gemini direct (no OpenRouter analog
+        without the ``google/`` prefix; ``make_backend`` will raise if the
+        key is missing).
+      - Slash-prefixed Gemini without a Google key → OpenRouter (graceful
+        fallback so existing OpenRouter-only setups keep working).
+      - Anything else → OpenRouter.
+    """
+    if is_gemini_direct(model) and google_api_key:
+        return "gemini"
+    if is_gemini_direct(model) and "/" not in model:
+        return "gemini"
+    return "openrouter"
 
 
 def make_backend(
@@ -471,14 +611,14 @@ def make_backend(
     openrouter_max_concurrent_calls: int = 4,
     gen_config: Optional[dict] = None,
 ) -> Backend:
-    """Pick the right backend for ``model`` based on its name.
+    """Pick the right backend for ``model`` based on its name and key
+    availability. See ``pick_provider`` for the routing rules.
 
-    Raises if the required key for the chosen provider is missing. ``gen_config``
-    is the unified sampling-params config (same shape for both backends);
-    OpenRouter-only keys (e.g. ``provider`` overrides) are ignored by
-    GeminiBackend, and vice versa.
+    ``gen_config`` is the unified sampling-params config (same shape for both
+    backends); OpenRouter-only keys (e.g. ``provider`` overrides) are ignored
+    by GeminiBackend, and vice versa.
     """
-    if is_gemini_direct(model):
+    if pick_provider(model, google_api_key) == "gemini":
         if not google_api_key:
             raise RuntimeError(
                 f"model {model!r} routes to Gemini direct; set $GOOGLE_API_KEY "
