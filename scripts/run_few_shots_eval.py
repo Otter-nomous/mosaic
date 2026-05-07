@@ -28,11 +28,12 @@ import os
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_SCRIPTS_DIR)
+sys.path.insert(0, _REPO_ROOT)
 from mosaic.data import load_examples  # noqa: E402
 
-_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-_RUN_EVAL = os.path.join(_REPO_ROOT, "run_eval.py")
+_RUN_EVAL = os.path.join(_SCRIPTS_DIR, "run_eval.py")
 _DEFAULT_DATA_DIR = os.path.join(_REPO_ROOT, "release_data", "eval")
 
 # Bare names → Gemini direct (uses GOOGLE_API_KEY / .secrets/google_api_key)

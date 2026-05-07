@@ -43,7 +43,7 @@ from mosaic.models import (
 from mosaic.pipeline import Pipeline, PipelineConfig
 
 
-_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DEFAULT_OPENROUTER_KEY_FILE = os.path.join(_REPO_ROOT, ".secrets", "openrouter_api_key")
 _DEFAULT_GOOGLE_KEY_FILE = os.path.join(_REPO_ROOT, ".secrets", "google_api_key")
 

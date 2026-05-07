@@ -52,11 +52,12 @@ from mosaic.reporting import ReportPaths, write_report, write_results_json
 from mosaic.schemas import IterationRecord, ValidationResult, VerificationResult
 
 
-_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_SCRIPTS_DIR)
 _DEFAULT_DATA_DIR = os.path.join(_REPO_ROOT, "release_data", "eval")
 _DEFAULT_OPENROUTER_KEY_FILE = os.path.join(_REPO_ROOT, ".secrets", "openrouter_api_key")
 _DEFAULT_GOOGLE_KEY_FILE = os.path.join(_REPO_ROOT, ".secrets", "google_api_key")
-_DEFAULT_GEN_CONFIG = os.path.join(_REPO_ROOT, "gen_config_v3.json")
+_DEFAULT_GEN_CONFIG = os.path.join(_SCRIPTS_DIR, "gen_config_v3.json")
 _DEFAULT_SOLVERS = [
     "openai/gpt-5.4-image-2",
     "google/gemini-3.1-flash-image-preview",
